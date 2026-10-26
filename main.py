@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import math
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -179,6 +180,145 @@ def fmt_pct(numerator: int, denominator: int) -> str:
     return f"{100 * numerator / denominator:.1f}%" if denominator else "—"
 
 
+
+FIXTURES_URL = "https://www.football-data.co.uk/matches/fixtures.csv"
+DIV_TO_LEAGUE = {code: name for name, code in LEAGUES.items()}
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_upcoming_fixtures() -> Tuple[pd.DataFrame, str]:
+    """Download the provider's separate upcoming-fixtures file; no fixtures are fabricated."""
+    response = requests.get(
+        FIXTURES_URL,
+        timeout=REQUEST_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+    )
+    response.raise_for_status()
+    frame = parse_csv_response(response.content)
+    # Normalize provider header variations while preserving original columns.
+    rename = {}
+    aliases = {
+        "Div": "Div", "div": "Div",
+        "Date": "Date", "date": "Date",
+        "Time": "Time", "time": "Time",
+        "HomeTeam": "HomeTeam", "home_team": "HomeTeam", "Home Team": "HomeTeam",
+        "AwayTeam": "AwayTeam", "away_team": "AwayTeam", "Away Team": "AwayTeam",
+        "B365H": "B365H", "b365_h": "B365H",
+        "B365D": "B365D", "b365_d": "B365D",
+        "B365A": "B365A", "b365_a": "B365A",
+        "B365>2.5": "B365>2.5", "b365_o25": "B365>2.5", "B365O25": "B365>2.5",
+        "B365<2.5": "B365<2.5", "b365_u25": "B365<2.5", "B365U25": "B365<2.5",
+        "AvgH": "AvgH", "avgh": "AvgH", "avg_h": "AvgH",
+        "AvgD": "AvgD", "avgd": "AvgD", "avg_d": "AvgD",
+        "AvgA": "AvgA", "avga": "AvgA", "avg_a": "AvgA",
+    }
+    for col in frame.columns:
+        clean = str(col).strip().replace("\ufeff", "")
+        if clean in aliases:
+            rename[col] = aliases[clean]
+    frame = frame.rename(columns=rename)
+    required = {"Date", "HomeTeam", "AwayTeam"}
+    if not required.issubset(frame.columns):
+        raise ValueError("Fikstür CSV'sinde tarih/takım sütunları bulunamadı: " + ", ".join(map(str, frame.columns[:20])))
+    frame["Date"] = pd.to_datetime(frame["Date"], dayfirst=True, errors="coerce")
+    frame["HomeTeam"] = frame["HomeTeam"].astype("string").str.strip()
+    frame["AwayTeam"] = frame["AwayTeam"].astype("string").str.strip()
+    frame = frame.dropna(subset=["Date", "HomeTeam", "AwayTeam"]).copy()
+    frame = frame[(frame["HomeTeam"] != "") & (frame["AwayTeam"] != "")]
+    if "Div" in frame.columns:
+        frame["Lig"] = frame["Div"].astype(str).map(DIV_TO_LEAGUE).fillna(frame["Div"].astype(str))
+    else:
+        frame["Lig"] = "Lig bilgisi kaynakta yok"
+    frame["Kaynak"] = FIXTURES_URL
+    return frame, "Fikstür kaynağı: Football-Data.co.uk"
+
+
+def poisson_probabilities(lam: float, max_goals: int = 10) -> list:
+    """Poisson probability mass through max_goals, with residual tail folded into the last bucket."""
+    lam = max(0.05, min(float(lam), 6.0))
+    probs = [math.exp(-lam)]
+    for k in range(1, max_goals + 1):
+        probs.append(probs[-1] * lam / k)
+    probs[-1] += max(0.0, 1.0 - sum(probs))
+    return probs
+
+
+def predict_fixture(home: str, away: str, league: str, history: pd.DataFrame) -> dict:
+    """Estimate markets from available completed scores; league averages backstop sparse team data."""
+    hist = history.copy()
+    if hist.empty or not {"FTHG", "FTAG", "HomeTeam", "AwayTeam"}.issubset(hist.columns):
+        hist = pd.DataFrame(columns=["FTHG", "FTAG", "HomeTeam", "AwayTeam", "Lig"])
+    hist["FTHG"] = pd.to_numeric(hist.get("FTHG"), errors="coerce")
+    hist["FTAG"] = pd.to_numeric(hist.get("FTAG"), errors="coerce")
+    hist = hist.dropna(subset=["FTHG", "FTAG"])
+    if "Lig" in hist.columns and league in set(hist["Lig"].astype(str)):
+        lh = hist[hist["Lig"].astype(str) == str(league)]
+    else:
+        lh = hist
+    if lh.empty:
+        lh = hist
+    if lh.empty:
+        return {"Maç başına ev golü": None, "Maç başına deplasman golü": None,
+                "MS 1 %": None, "MS X %": None, "MS 2 %": None,
+                "2.5 Üst %": None, "2.5 Alt %": None, "KG Var %": None,
+                "Tahmin notu": "Yeterli tamamlanmış maç verisi yok; tahmin üretilemedi."}
+
+    league_home_avg = float(lh["FTHG"].mean())
+    league_away_avg = float(lh["FTAG"].mean())
+    league_home_avg = max(0.2, min(league_home_avg, 4.0))
+    league_away_avg = max(0.2, min(league_away_avg, 4.0))
+
+    # Use venue-specific team records when available; shrink small samples toward league average.
+    home_home = lh[lh["HomeTeam"].astype(str).str.casefold() == str(home).casefold()]
+    away_away = lh[lh["AwayTeam"].astype(str).str.casefold() == str(away).casefold()]
+    home_away = lh[lh["AwayTeam"].astype(str).str.casefold() == str(home).casefold()]
+    away_home = lh[lh["HomeTeam"].astype(str).str.casefold() == str(away).casefold()]
+
+    def smoothed_mean(frame: pd.DataFrame, col: str, baseline: float) -> float:
+        values = pd.to_numeric(frame[col], errors="coerce").dropna() if col in frame else pd.Series(dtype=float)
+        n = len(values)
+        # Four pseudo-observations stabilize estimates for teams with little history.
+        return float((values.sum() + 4.0 * baseline) / (n + 4.0)) if n else baseline
+
+    home_attack = smoothed_mean(home_home, "FTHG", league_home_avg)
+    home_defence = smoothed_mean(home_away, "FTAG", league_away_avg)
+    away_attack = smoothed_mean(away_away, "FTAG", league_away_avg)
+    away_defence = smoothed_mean(away_home, "FTHG", league_home_avg)
+    exp_home = max(0.15, min(4.5, (home_attack / league_home_avg) * (away_defence / league_home_avg) * league_home_avg))
+    exp_away = max(0.15, min(4.5, (away_attack / league_away_avg) * (home_defence / league_away_avg) * league_away_avg))
+    ph = poisson_probabilities(exp_home)
+    pa = poisson_probabilities(exp_away)
+    p1 = px = p2 = p_over = p_btts = 0.0
+    for i, pi in enumerate(ph):
+        for j, pj in enumerate(pa):
+            prob = pi * pj
+            if i > j:
+                p1 += prob
+            elif i == j:
+                px += prob
+            else:
+                p2 += prob
+            if i + j >= 3:
+                p_over += prob
+            if i > 0 and j > 0:
+                p_btts += prob
+    return {
+        "Maç başına ev golü": round(exp_home, 2),
+        "Maç başına deplasman golü": round(exp_away, 2),
+        "MS 1 %": round(p1 * 100, 1), "MS X %": round(px * 100, 1), "MS 2 %": round(p2 * 100, 1),
+        "2.5 Üst %": round(p_over * 100, 1), "2.5 Alt %": round((1 - p_over) * 100, 1),
+        "KG Var %": round(p_btts * 100, 1), "KG Yok %": round((1 - p_btts) * 100, 1),
+        "Tahmin notu": f"Model: mevcut geçmiş skorlar ve lig ortalaması; beklenen gol {exp_home:.2f}-{exp_away:.2f}. Kadro/sakatlık/xG bilgisi içermez."
+    }
+
+
+def add_odds_value(row: dict, fixture: pd.Series, odds_col: str, probability_key: str) -> None:
+    value = pd.to_numeric(pd.Series([fixture.get(odds_col)]), errors="coerce").iloc[0]
+    prob_pct = row.get(probability_key)
+    if pd.notna(value) and value > 1 and prob_pct is not None and prob_pct > 0:
+        row[odds_col + " gerçek oran"] = round(float(value), 2)
+        row[probability_key.replace(" %", " adil oran")] = round(100.0 / float(prob_pct), 2)
+        row[probability_key.replace(" %", " beklenen getiri %")] = round((float(value) * float(prob_pct) / 100.0 - 1.0) * 100.0, 1)
+
 st.title("⚽ FREKANS X")
 st.caption(f"Futbol verileri • Tarihsel oran analizi • Sürüm {APP_VERSION}")
 st.info(
@@ -242,7 +382,7 @@ c3.metric("Lig sayısı", str(matches["Lig"].nunique()))
 c4.metric("Tarih aralığı", f"{matches['Date'].min():%d.%m.%Y} – {matches['Date'].max():%d.%m.%Y}")
 
 tabs = st.tabs([
-    "Genel görünüm", "Oran analizi", "Benzer oranlı maçlar",
+    "Genel görünüm", "Gelecek maç tahminleri", "Oran analizi", "Benzer oranlı maçlar",
     "Gol ve KG", "Maç listesi", "İndir / dışa aktar"
 ])
 
@@ -268,6 +408,51 @@ with tabs[0]:
         st.dataframe(finished[cols].sort_values("Date", ascending=False).head(100), use_container_width=True, hide_index=True)
 
 with tabs[1]:
+    st.subheader("Bugün ve önümüzdeki 7 gün: fikstür ve tahminler")
+    st.caption("Gelecek fikstür ayrı kaynaktan çekilir. Olasılıklar basit Poisson modelidir; kesin tahmin değildir.")
+    force_fixtures = st.button("Gelecek maçları güncelle", key="refresh_fixtures")
+    try:
+        if force_fixtures:
+            fetch_upcoming_fixtures.clear()
+        upcoming, fixtures_note = fetch_upcoming_fixtures()
+        st.caption(fixtures_note)
+        today = pd.Timestamp.now().normalize()
+        end_date = today + pd.Timedelta(days=7)
+        upcoming = upcoming[(upcoming["Date"] >= today) & (upcoming["Date"] < end_date + pd.Timedelta(days=1))].copy()
+        if selected_leagues and "Lig" in upcoming.columns:
+            # Only filter if source division codes map to the selected leagues; unknown names remain visible when no direct match exists.
+            mapped = upcoming[upcoming["Lig"].isin(selected_leagues)]
+            if not mapped.empty:
+                upcoming = mapped
+        if upcoming.empty:
+            st.warning("Kaynakta bugün ile önümüzdeki 7 gün arasında fikstür bulunamadı. Kaynak henüz güncellenmemiş olabilir; bu durum maç olmadığı anlamına gelmez.")
+        else:
+            predictions = []
+            for _, fixture in upcoming.iterrows():
+                league_name = str(fixture.get("Lig", ""))
+                row = {
+                    "Tarih": fixture["Date"].strftime("%d.%m.%Y"),
+                    "Saat": str(fixture.get("Time", "")) if pd.notna(fixture.get("Time", pd.NA)) else "",
+                    "Lig": league_name,
+                    "Ev sahibi": str(fixture["HomeTeam"]),
+                    "Deplasman": str(fixture["AwayTeam"]),
+                }
+                pred = predict_fixture(str(fixture["HomeTeam"]), str(fixture["AwayTeam"]), league_name, matches)
+                row.update(pred)
+                for odds_col, prob_key in [("B365H", "MS 1 %"), ("B365D", "MS X %"), ("B365A", "MS 2 %"), ("B365>2.5", "2.5 Üst %"), ("B365<2.5", "2.5 Alt %")]:
+                    add_odds_value(row, fixture, odds_col, prob_key)
+                predictions.append(row)
+            pred_df = pd.DataFrame(predictions)
+            st.metric("Önümüzdeki 7 gündeki fikstür", len(pred_df))
+            display_cols = [c for c in ["Tarih", "Saat", "Lig", "Ev sahibi", "Deplasman", "Maç başına ev golü", "Maç başına deplasman golü", "MS 1 %", "MS X %", "MS 2 %", "2.5 Üst %", "2.5 Alt %", "KG Var %", "KG Yok %", "B365H gerçek oran", "B365D gerçek oran", "B365A gerçek oran", "B365>2.5 gerçek oran", "B365<2.5 gerçek oran"] if c in pred_df.columns]
+            st.dataframe(pred_df[display_cols], use_container_width=True, hide_index=True)
+            st.download_button("Gelecek maç tahminlerini CSV indir", pred_df.to_csv(index=False).encode("utf-8-sig"), file_name="frekans_x_gelecek_tahminleri.csv", mime="text/csv")
+            st.warning("Model tahminleri yalnızca geçmiş skor verileriyle hesaplanır. Gerçek oran sütunu boşsa kaynak o maç/pazar için oran sağlamamıştır. Beklenen getiri tek başına bahis önerisi değildir.")
+    except Exception as exc:
+        st.error(f"Gelecek fikstürü alınamadı: {str(exc)[:300]}")
+        st.info("İnternet erişimini ve veri kaynağını kontrol edip 'Gelecek maçları güncelle' düğmesini yeniden deneyin.")
+
+with tabs[2]:
     st.subheader("Gerçek oranlara göre tarihsel analiz")
     available_markets = [m for m in MARKETS if find_odds_column(matches, m) is not None and MARKETS[m]["result_col"] in matches.columns]
     if not available_markets:
@@ -299,7 +484,7 @@ with tabs[1]:
                 st.dataframe(eligible.sort_values("Getiri %", ascending=False).head(5), use_container_width=True, hide_index=True)
                 st.caption("Bu sıralama yalnızca geçmiş örneklemi tarif eder; geleceğe yönelik garanti veya kesin bahis önerisi değildir.")
 
-with tabs[2]:
+with tabs[3]:
     st.subheader("Benzer oranlı geçmiş maçlar")
     market_options = [m for m in MARKETS if find_odds_column(matches, m) is not None and MARKETS[m]["result_col"] in matches.columns]
     if not market_options:
@@ -327,7 +512,7 @@ with tabs[2]:
                 st.dataframe(similar[display_cols].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
                 st.caption("Benzer oranlı geçmiş maçlar yalnızca karşılaştırma içindir; maçlar birbirinden bağımsız olmayabilir.")
 
-with tabs[3]:
+with tabs[4]:
     st.subheader("Gol ve KG Var/Yok istatistikleri")
     if "Toplam Gol" not in matches.columns:
         st.info("Tam maç skoru sütunları kaynakta bulunamadı.")
@@ -355,7 +540,7 @@ with tabs[3]:
             st.dataframe(by_league, use_container_width=True, hide_index=True)
             st.caption("KG Var/Yok için burada sonuç yüzdesi hesaplanır; kaynakta gerçek KG oranı yoksa oran analizi veya getiri hesabı yapılmaz.")
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("Filtrelenmiş maç kayıtları")
     league_filter = st.multiselect("Maç listesindeki ligler", sorted(matches["Lig"].dropna().unique().tolist()), default=sorted(matches["Lig"].dropna().unique().tolist()), key="match_leagues")
     date_min = matches["Date"].min().date()
@@ -368,7 +553,7 @@ with tabs[4]:
     cols = [c for c in ["Date", "Lig", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "HTHG", "HTAG", "MS Sonuç", "KG Sonuç", "2.5 Sonuç"] if c in listing.columns]
     st.dataframe(listing[cols].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("Verileri dışa aktar")
     st.write("Seçili sezon ve ligler için alınan ham kayıtları veya maç sonuçları eklenmiş verileri CSV olarak indirebilirsin.")
     st.download_button(
