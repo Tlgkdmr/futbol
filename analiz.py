@@ -1266,7 +1266,7 @@ elif menu_choice == "Test Paneli (Geliştirici Modülü)":
                 conn.commit()
                 conn.close()
 
-                global _migration_hook_error
+                
                 _migration_hook_error = RuntimeError("TEST: Genişletilmiş gerçek transaction rollback tetiklendi")
                 rollback_occurred = False
 
